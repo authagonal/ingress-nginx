@@ -40,6 +40,22 @@ on:
     branches: [drawboard/main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: The commit to build
+        type: string
+        required: true
+    outputs:
+      controller:
+        description: The controller image, <repository>:<tag>@sha256:<digest>
+        value: ${{ jobs.images.outputs.controller }}
+      certgen:
+        description: The kube-webhook-certgen image, <repository>:<tag>@sha256:<digest>
+        value: ${{ jobs.images.outputs.certgen }}
+      base:
+        description: The patched nginx base image, <repository>:<tag>@sha256:<digest>
+        value: ${{ jobs.images.outputs.base }}
 
 permissions: {}
 
@@ -63,6 +79,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ inputs.ref }} # empty unless called, which is the event's own commit
           persist-credentials: false
 
       - name: Run nginx-tests against the patched nginx
@@ -77,11 +94,17 @@ jobs:
       contents: read
       packages: write # push to GHCR with the GITHUB_TOKEN; only used when publishing
       id-token: write # cosign keyless signing; only used when publishing
+    outputs:
+      # <repository>:<tag>@sha256:<digest>; empty unless the run published (the Publish: push step sets the digests)
+      controller: ${{ steps.push.outputs.controller_digest && format('{0}@{1}', steps.tags.outputs.controller, steps.push.outputs.controller_digest) || '' }}
+      certgen: ${{ steps.push.outputs.certgen_digest && format('{0}@{1}', steps.tags.outputs.certgen, steps.push.outputs.certgen_digest) || '' }}
+      base: ${{ steps.push.outputs.base_digest && format('{0}@{1}', steps.tags.outputs.base, steps.push.outputs.base_digest) || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0 # git describe needs the controller-v* tags
+          ref: ${{ inputs.ref }} # empty unless called, which is the event's own commit
           persist-credentials: false
 
       - name: Check that the certgen tag follows GOLANG_VERSION
