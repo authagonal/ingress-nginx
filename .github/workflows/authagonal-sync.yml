@@ -1,0 +1,158 @@
+# Authagonal's sync of Drawboard's ingress-nginx fixes: brings drawboard/main into the branch it runs on, builds and signs the images
+# through authagonal-images.yml, and opens the image bump PR into authagonal-cloud's develop.
+#
+# The logic is hack/authagonal-sync/sync.py (tested by hack/authagonal-sync/tests); the jobs only call it:
+#   test      pull requests only: the sync's unit tests. It holds no token and writes nothing.
+#   bring-in  merges Drawboard in and pushes (or opens the person PR when it conflicts or Drawboard rewrote its branch), then says whether to build.
+#   build     calls authagonal-images.yml on the commit bring-in names, so the images are signed by the workflow file the cosign verify command names.
+#   bump      opens the PR into authagonal-cloud's develop.
+#
+# A schedule runs only on the default branch, and a dispatch acts on the branch it is dispatched on. A run that finds Drawboard already
+# brought in, and a bump PR already opened for its head (open or closed), builds and opens nothing; `force` builds and opens one anyway.
+#
+# Credentials: the GitHub App authagonal-ingress-nginx-sync. Each job mints an installation token for the one repository it writes, from the
+# variable AUTHAGONAL_SYNC_APP_ID and the secret AUTHAGONAL_SYNC_APP_PRIVATE_KEY. GitHub's own token cannot push workflow changes (Drawboard's
+# commits can touch .github/workflows), and the pushes and PRs it makes start no workflow, so authagonal-cloud's PR checks would never run.
+
+name: Authagonal sync
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build and open a PR even when one already exists for this Drawboard head
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - hack/authagonal-sync/**
+      - .github/workflows/authagonal-sync.yml
+
+permissions: {}
+
+concurrency:
+  group: authagonal-sync-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Run the sync's unit tests
+        working-directory: hack/authagonal-sync
+        run: python3 -m unittest discover -s tests -t .
+
+  bring-in:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: write # re-enable this workflow on a schedule (resets GitHub's 60-day disable of a quiet public repository's schedules)
+      contents: read
+    outputs:
+      build: ${{ steps.sync.outputs.build }}
+      commit: ${{ steps.sync.outputs.commit }}
+      drawboard: ${{ steps.sync.outputs.drawboard }}
+      bump_branch: ${{ steps.sync.outputs.bump_branch }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Keep the schedule alive
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/authagonal-sync.yml/enable"
+
+      - name: Token for the fork
+        id: fork-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.AUTHAGONAL_SYNC_APP_ID }}
+          private-key: ${{ secrets.AUTHAGONAL_SYNC_APP_PRIVATE_KEY }}
+          owner: authagonal
+          repositories: ingress-nginx
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - name: Token for reading authagonal-cloud's pull requests
+        id: cloud-read-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.AUTHAGONAL_SYNC_APP_ID }}
+          private-key: ${{ secrets.AUTHAGONAL_SYNC_APP_PRIVATE_KEY }}
+          owner: authagonal
+          repositories: authagonal-cloud
+          permission-pull-requests: read
+
+      - name: Bring Drawboard in
+        id: sync
+        env:
+          GH_TOKEN: ${{ steps.fork-token.outputs.token }}
+          SYNC_CLOUD_TOKEN: ${{ steps.cloud-read-token.outputs.token }}
+          SYNC_APP_SLUG: ${{ steps.fork-token.outputs.app-slug }}
+          SYNC_FORCE: ${{ inputs.force && 'true' || 'false' }}
+        run: python3 hack/authagonal-sync/sync.py bring-in
+
+  build:
+    needs: bring-in
+    if: github.event_name != 'pull_request' && needs.bring-in.outputs.build == 'true'
+    # what the called jobs ask for, exactly: nginx-tests contents read; images contents read, packages write, id-token write
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    uses: ./.github/workflows/authagonal-images.yml
+    with:
+      ref: ${{ needs.bring-in.outputs.commit }}
+
+  bump:
+    needs: [bring-in, build]
+    if: github.event_name != 'pull_request' && needs.bring-in.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60 # the wait for a terraform.yml run on develop is up to 30 minutes
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Token for authagonal-cloud
+        id: cloud-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.AUTHAGONAL_SYNC_APP_ID }}
+          private-key: ${{ secrets.AUTHAGONAL_SYNC_APP_PRIVATE_KEY }}
+          owner: authagonal
+          repositories: authagonal-cloud
+          permission-contents: write
+          permission-pull-requests: write
+          permission-actions: read # the wait for a terraform.yml run on develop
+
+      - name: Open the bump PR
+        env:
+          GH_TOKEN: ${{ steps.cloud-token.outputs.token }}
+          SYNC_APP_SLUG: ${{ steps.cloud-token.outputs.app-slug }}
+          SYNC_CONTROLLER: ${{ needs.build.outputs.controller }}
+          SYNC_CERTGEN: ${{ needs.build.outputs.certgen }}
+          SYNC_BASE: ${{ needs.build.outputs.base }}
+          SYNC_COMMIT: ${{ needs.bring-in.outputs.commit }}
+          SYNC_DRAWBOARD: ${{ needs.bring-in.outputs.drawboard }}
+          SYNC_BUMP_BRANCH: ${{ needs.bring-in.outputs.bump_branch }}
+        run: python3 hack/authagonal-sync/sync.py bump
