@@ -61,6 +61,38 @@ class BringInTest(WorldCase):
         self.assertEqual(r.outputs["outcome"], "rewritten-pr")
         self.assertIn(d1, self.w.pulls(FORK_REPO)[0]["body"])
 
+    def _resolve_rewrite_by_a_person(self):
+        """d1 merged; Drawboard rewrites to d2; the person merges the PR's head into T with a merge commit that has no trailer."""
+        d1 = self.w.drawboard_commit("new.txt", "from drawboard\n")
+        self.ok(self.w.bring_in())
+        d2 = self.w.drawboard_rewrite("other.txt", "after the rewrite\n")
+        self.assertEqual(self.ok(self.w.bring_in()).outputs["outcome"], "rewritten-pr")
+        git(self.w.fwork, "pull", "--quiet", "--ff-only", "origin", T)
+        git(self.w.fwork, "pull", "--quiet", "--no-rebase", "--allow-unrelated-histories", "--no-edit", self.w.drawboard, T)
+        git(self.w.fwork, "push", "--quiet", "origin", f"HEAD:refs/heads/{T}")
+        self.assertEqual(git(self.w.fwork, "log", "-1", "--format=%(trailers:key=Drawboard-Head,valueonly)"), "")
+        self.assertEqual(self.ok(self.w.bring_in()).outputs["outcome"], "contained")
+        return d1, d2
+
+    def test_after_a_person_resolves_a_rewrite_the_next_drawboard_commit_is_merged(self):
+        _, d2 = self._resolve_rewrite_by_a_person()
+        d3 = self.w.drawboard_commit("third.txt", "on top of the rewrite\n")
+        r = self.ok(self.w.bring_in())
+        head = self.w.head(self.w.fork, T)
+        self.assertEqual((r.outputs["outcome"], r.outputs["build"], r.outputs["drawboard"]), ("merged", "true", d3), r.stdout)
+        self.assertEqual(git(self.w.fork, "rev-parse", f"{head}^2"), d3)
+        self.assertEqual(r.outputs["bump_branch"], CLOUD_PFX + d3[:12])
+
+    def test_a_second_rewrite_after_a_resolved_one_is_still_a_rewrite(self):
+        self._resolve_rewrite_by_a_person()
+        before = self.w.head(self.w.fork, T)
+        git(self.w.dwork, "checkout", "--quiet", "--orphan", "again")
+        self.w.write(self.w.dwork, "again.txt", "x\n")
+        self.w.commit(self.w.dwork, "rewritten again")
+        git(self.w.dwork, "push", "--quiet", "--force", "origin", f"HEAD:refs/heads/{T}")
+        r = self.ok(self.w.bring_in())
+        self.assertEqual((r.outputs["outcome"], self.w.head(self.w.fork, T)), ("rewritten-pr", before))
+
     def test_trailer_constant_is_the_head_the_fork_was_built_from(self):
         spec = importlib.util.spec_from_file_location("sync_under_test", SYNC)
         mod = importlib.util.module_from_spec(spec)

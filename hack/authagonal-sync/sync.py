@@ -168,6 +168,17 @@ def last_brought_in(clone, head):
     return LAST_BROUGHT_IN
 
 
+def resolved_head(clone, head, D, last):
+    """`last` is not in D's history. When a person has since merged a rewritten D into T, that merge has no trailer, so `last` is stale: the newest
+    Drawboard commit T and D share (their merge base) is then the head last brought in. It is that only when it is newer than `last`; a merge base
+    that is `last` or one of its ancestors is the common history a real rewrite keeps. Returns that commit, or None for a rewrite (and for a `last` T does not hold, which it cannot compare)."""
+    mb = git(["merge-base", head, D], cwd=clone, check=False)
+    base = mb.stdout.strip() if mb.returncode == 0 else ""
+    if not base or not has_commit(clone, last) or is_ancestor(clone, base, last):
+        return None  # nothing to compare the base with, or it is no newer than `last`
+    return base
+
+
 def person_pr(cfg, clone, T, D, last, kind, detail, out):
     """D-6: D goes to the fork as authagonal-sync/drawboard-<D12>, and a PR from it into T says what a person does. One per D, in any state."""
     d12 = D[:12]
@@ -219,6 +230,11 @@ def bring_in(a):
             outcome = "contained"
         else:
             last = last_brought_in(clone, head)
+            if not has_commit(clone, last) or not is_ancestor(clone, last, D):
+                resolved = resolved_head(clone, head, D, last)
+                if resolved:
+                    log(f"Drawboard's history does not contain the trailer's head {last[:12]}, but T holds {resolved[:12]} of it: a rewrite a person resolved")
+                    last = resolved
             if not has_commit(clone, last) or not is_ancestor(clone, last, D):
                 log(f"Drawboard's history does not contain the last brought-in head {last[:12]}: rewritten")
                 person_pr(cfg, clone, T, D, last, "rewritten", None, out)
