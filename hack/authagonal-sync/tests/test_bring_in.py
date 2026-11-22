@@ -141,6 +141,41 @@ class BringInTest(WorldCase):
         self.assertEqual(git(self.w.fork, "rev-parse", "controller-v1.2.0^{commit}"), d)
         self.assertEqual(self.w.head(self.w.fork, "controller-v1.0.0"), fork_v100, "a tag the fork already has is never moved")
 
+    def test_contained_after_a_person_merge_still_pushes_the_controller_tag(self):
+        self.w.drawboard_commit("new.txt", "from drawboard\n")
+        self.ok(self.w.bring_in())
+        d2 = self.w.drawboard_rewrite("other.txt", "after the rewrite\n")
+        self.assertEqual(self.ok(self.w.bring_in()).outputs["outcome"], "rewritten-pr")
+        git(self.w.dwork, "tag", "controller-v1.5.0", d2)
+        git(self.w.dwork, "push", "--quiet", "origin", "controller-v1.5.0")
+        git(self.w.fwork, "pull", "--quiet", "--ff-only", "origin", T)
+        git(self.w.fwork, "pull", "--quiet", "--no-rebase", "--allow-unrelated-histories", "--no-edit", self.w.drawboard, T)
+        git(self.w.fwork, "push", "--quiet", "origin", f"HEAD:refs/heads/{T}")
+        r = self.ok(self.w.bring_in())
+        self.assertEqual((r.outputs["outcome"], r.outputs["build"]), ("contained", "true"))
+        self.assertEqual(git(self.w.fork, "rev-parse", "controller-v1.5.0^{commit}"), d2)
+
+    def test_contained_after_drawboard_tags_the_merged_head_pushes_the_controller_tag(self):
+        d = self.w.drawboard_commit("new.txt", "from drawboard\n")
+        self.assertEqual(self.ok(self.w.bring_in()).outputs["outcome"], "merged")
+        self.assertEqual(git(self.w.fork, "tag", "--list"), "")
+        git(self.w.dwork, "tag", "controller-v1.6.0", d)
+        git(self.w.dwork, "push", "--quiet", "origin", "controller-v1.6.0")
+        before = self.w.head(self.w.fork, T)
+        r = self.ok(self.w.bring_in("--force"))
+        self.assertEqual((r.outputs["outcome"], r.outputs["build"], self.w.head(self.w.fork, T)), ("contained-forced", "true", before))
+        self.assertEqual(git(self.w.fork, "rev-parse", "controller-v1.6.0^{commit}"), d)
+
+    def test_a_contained_run_that_builds_nothing_pushes_no_tag(self):
+        d = self.w.drawboard_commit("new.txt", "from drawboard\n")
+        self.ok(self.w.bring_in())
+        self.w.add_pr(CLOUD_REPO, CLOUD_PFX + d[:12], "open")
+        git(self.w.dwork, "tag", "controller-v1.7.0", d)
+        git(self.w.dwork, "push", "--quiet", "origin", "controller-v1.7.0")
+        r = self.ok(self.w.bring_in())
+        self.assertEqual(r.outputs["build"], "false")
+        self.assertEqual(git(self.w.fork, "tag", "--list"), "")
+
     def test_fast_forward_only_when_t_moves_during_the_run_nothing_is_forced(self):
         d = self.w.drawboard_commit("new.txt", "from drawboard\n")
         git(self.w.dwork, "tag", "controller-v1.1.0", d)

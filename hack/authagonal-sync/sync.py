@@ -179,6 +179,23 @@ def resolved_head(clone, head, D, last):
     return base
 
 
+def missing_tags(cfg, clone, D):
+    """Drawboard's controller-v* tags in D's history that the fork lacks: the controller image is named after the newest git describe finds."""
+    git(["fetch", "--quiet", "--no-tags", cfg.drawboard_url, "+refs/tags/controller-v*:refs/tags/controller-v*"], cwd=clone)
+    have = {ln.split("refs/tags/", 1)[1] for ln in git(["ls-remote", "--tags", "--refs", cfg.fork_url, "controller-v*"], cwd=clone,
+                                                            token=cfg.token).stdout.splitlines() if "refs/tags/" in ln}
+    return [t for t in git(["tag", "--list", "controller-v*"], cwd=clone).stdout.split() if t not in have and is_ancestor(clone, f"{t}^{{commit}}", D)]
+
+
+def push_tags(cfg, clone, D):
+    """Every run that sets build=true leaves the fork with those tags, whether or not it merged: a head that was contained already, because a
+    person merged it or Drawboard tagged it after the merge, is built and named after them too."""
+    tags = missing_tags(cfg, clone, D)
+    if tags:
+        git(["push", cfg.fork_url, *[f"refs/tags/{t}:refs/tags/{t}" for t in tags]], cwd=clone, token=cfg.token)
+    log(f"pushed tags {tags}")
+
+
 def person_pr(cfg, clone, T, D, last, kind, detail, out):
     """D-6: D goes to the fork as authagonal-sync/drawboard-<D12>, and a PR from it into T says what a person does. One per D, in any state."""
     d12 = D[:12]
@@ -252,12 +269,7 @@ def bring_in(a):
                 person_pr(cfg, clone, T, D, last, "conflict", conflicted, out)
                 out.set("commit", head)
                 return out.flush()
-            # Drawboard's controller-v* tags in D's history that the fork lacks: the controller image is named after the newest git describe finds
-            git(["fetch", "--quiet", "--no-tags", cfg.drawboard_url, "+refs/tags/controller-v*:refs/tags/controller-v*"], cwd=clone)
-            have = {ln.split("refs/tags/", 1)[1] for ln in git(["ls-remote", "--tags", "--refs", cfg.fork_url, "controller-v*"], cwd=clone,
-                                                                    token=cfg.token).stdout.splitlines() if "refs/tags/" in ln}
-            tags = [t for t in git(["tag", "--list", "controller-v*"], cwd=clone).stdout.split()
-                    if t not in have and is_ancestor(clone, f"{t}^{{commit}}", D)]
+            tags = missing_tags(cfg, clone, D)
             new_head = git(["rev-parse", "HEAD"], cwd=clone).stdout.strip()
             # a fast-forward of T, never a force: the push is refused when T moved meanwhile, and the next run starts again
             push = git(["push", "--atomic", cfg.fork_url, f"HEAD:refs/heads/{T}", *[f"refs/tags/{t}:refs/tags/{t}" for t in tags]],
@@ -271,6 +283,8 @@ def bring_in(a):
         out.set("commit", head)
         branch = CLOUD_BRANCH_PREFIX + d12
         if force:
+            if outcome == "contained":
+                push_tags(cfg, clone, D)
             out.set("build", "true")
             out.set("bump_branch", f"{branch}-run{run_id}")
             out.set("outcome", f"{outcome}-forced")
@@ -281,6 +295,8 @@ def bring_in(a):
             out.set("outcome", f"{outcome}-already-handled")
             log(f"{cfg.cloud_repo} already has a PR (any state) for {branch}: nothing more")
         else:
+            if outcome == "contained":
+                push_tags(cfg, clone, D)
             out.set("build", "true")
             out.set("bump_branch", branch)
             out.set("outcome", outcome)
