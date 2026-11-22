@@ -161,24 +161,28 @@ def has_commit(repo_dir, sha):
 
 # ------------------------------------------------------------------------------------------------ bring-in (D-2, D-3, D-6)
 def last_brought_in(clone, head):
-    """The newest Drawboard-Head trailer on T's first-parent history, else the constant."""
-    r = git(["log", "--first-parent", "-z", f"--format=%(trailers:key={TRAILER},valueonly,separator=%x20)", head], cwd=clone)
+    """The newest Drawboard head T holds: walking T's first-parent history from the top, a Drawboard-Head trailer names it, and so does the second
+    parent of a merge a person made (no trailer) when its subject mentions Drawboard (git's "Merge branch 'drawboard/main'", GitHub's "Merge pull
+    request ... from .../authagonal-sync/drawboard-<d12>"): that is a resolved rewrite or conflict PR, whose head is a Drawboard head. A merge of
+    anything else is not one. Else the constant."""
+    r = git(["log", "--first-parent", "-z", "--format=%P%x09%s%x09%(trailers:key=" + TRAILER + ",valueonly,separator=%x20)", head], cwd=clone)
     for rec in r.stdout.split("\0"):
-        for tok in rec.split():
+        parents, _, rest = rec.lstrip("\n").partition("\t")
+        subject, _, trailers = rest.partition("\t")
+        for tok in trailers.split():
             if re.fullmatch(r"[0-9a-f]{40}", tok):
                 return tok
+        ps = parents.split()
+        if len(ps) >= 2 and "drawboard" in subject.lower():
+            # a PR resolved on its branch (T merged into it) is merged as a commit that is not Drawboard's; the branch name carries the head the sync pushed
+            m = re.search(re.escape(PERSON_BRANCH_PREFIX) + r"([0-9a-f]{12})\b", subject)
+            if m:
+                r = git(["rev-parse", "--verify", "--quiet", m.group(1) + "^{commit}"], cwd=clone, check=False)
+                full = r.stdout.strip()
+                if full and is_ancestor(clone, full, ps[1]):
+                    return full
+            return ps[1]
     return LAST_BROUGHT_IN
-
-
-def resolved_head(clone, head, D, last):
-    """`last` is not in D's history. When a person has since merged a rewritten D into T, that merge has no trailer, so `last` is stale: the newest
-    Drawboard commit T and D share (their merge base) is then the head last brought in. It is that only when it is newer than `last`; a merge base
-    that is `last` or one of its ancestors is the common history a real rewrite keeps. Returns that commit, or None for a rewrite (and for a `last` T does not hold, which it cannot compare)."""
-    mb = git(["merge-base", head, D], cwd=clone, check=False)
-    base = mb.stdout.strip() if mb.returncode == 0 else ""
-    if not base or not has_commit(clone, last) or is_ancestor(clone, base, last):
-        return None  # nothing to compare the base with, or it is no newer than `last`
-    return base
 
 
 def missing_tags(cfg, clone, D):
@@ -249,11 +253,6 @@ def bring_in(a):
             outcome = "contained"
         else:
             last = last_brought_in(clone, head)
-            if not has_commit(clone, last) or not is_ancestor(clone, last, D):
-                resolved = resolved_head(clone, head, D, last)
-                if resolved:
-                    log(f"Drawboard's history does not contain the trailer's head {last[:12]}, but T holds {resolved[:12]} of it: a rewrite a person resolved")
-                    last = resolved
             if not has_commit(clone, last) or not is_ancestor(clone, last, D):
                 log(f"Drawboard's history does not contain the last brought-in head {last[:12]}: rewritten")
                 person_pr(cfg, clone, T, D, last, "rewritten", None, out)

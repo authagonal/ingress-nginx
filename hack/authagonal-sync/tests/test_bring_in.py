@@ -93,6 +93,77 @@ class BringInTest(WorldCase):
         r = self.ok(self.w.bring_in())
         self.assertEqual((r.outputs["outcome"], self.w.head(self.w.fork, T)), ("rewritten-pr", before))
 
+    def _person_merges_drawboard(self, *extra):
+        git(self.w.fwork, "pull", "--quiet", "--ff-only", "origin", T)
+        git(self.w.fwork, "pull", "--quiet", "--no-rebase", "--allow-unrelated-histories", "--no-edit", *extra, self.w.drawboard, T)
+        git(self.w.fwork, "push", "--quiet", "origin", f"HEAD:refs/heads/{T}")
+
+    def test_a_rewrite_of_a_head_a_person_merged_is_still_a_rewrite(self):
+        # d1 merged with its trailer; Drawboard rewrites to r1, r2; a person merges r2; Drawboard keeps r1 and replaces r2 with r2b
+        self.w.drawboard_commit("new.txt", "from drawboard\n")
+        self.ok(self.w.bring_in())
+        git(self.w.dwork, "checkout", "--quiet", "--orphan", "again")
+        self.w.write(self.w.dwork, "r1.txt", "r1\n")
+        r1 = self.w.commit(self.w.dwork, "r1")
+        self.w.write(self.w.dwork, "r2.txt", "r2\n")
+        r2 = self.w.commit(self.w.dwork, "r2")
+        git(self.w.dwork, "push", "--quiet", "--force", "origin", f"HEAD:refs/heads/{T}")
+        self.assertEqual(self.ok(self.w.bring_in()).outputs["outcome"], "rewritten-pr")
+        self._person_merges_drawboard()
+        self.assertEqual(self.ok(self.w.bring_in()).outputs["outcome"], "contained")
+        git(self.w.dwork, "reset", "--quiet", "--hard", r1)
+        self.w.write(self.w.dwork, "r2b.txt", "r2b\n")
+        self.w.commit(self.w.dwork, "r2b")
+        git(self.w.dwork, "push", "--quiet", "--force", "origin", f"HEAD:refs/heads/{T}")
+        before = self.w.head(self.w.fork, T)
+        r = self.ok(self.w.bring_in())
+        self.assertEqual((r.outputs["outcome"], r.outputs["build"], self.w.head(self.w.fork, T)), ("rewritten-pr", "false", before), r.stdout)
+        self.assertIn(r2, self.w.pulls(FORK_REPO)[-1]["body"])
+
+    def test_a_rewrite_after_a_person_resolved_a_conflict_is_still_a_rewrite(self):
+        self.w.fork_commit("a.txt", "one\nFORK\nthree\n")
+        self.w.drawboard_commit("a.txt", "one\nDRAWBOARD\nthree\n", "dc")
+        self.assertEqual(self.ok(self.w.bring_in()).outputs["outcome"], "conflict-pr")
+        self._person_merges_drawboard("-X", "ours")
+        self.assertEqual(self.ok(self.w.bring_in()).outputs["outcome"], "contained")
+        git(self.w.dwork, "reset", "--quiet", "--hard", self.w.base)                      # back to the head T last had a trailer for, plus a replacement
+        self.w.write(self.w.dwork, "replacement.txt", "x\n")
+        self.w.commit(self.w.dwork, "replacement of dc")
+        git(self.w.dwork, "push", "--quiet", "--force", "origin", f"HEAD:refs/heads/{T}")
+        before = self.w.head(self.w.fork, T)
+        r = self.ok(self.w.bring_in())
+        self.assertEqual((r.outputs["outcome"], self.w.head(self.w.fork, T)), ("rewritten-pr", before), r.stdout)
+
+    def test_a_pr_resolved_on_its_branch_then_merged_does_not_make_the_next_drawboard_commit_a_rewrite(self):
+        self.w.fork_commit("a.txt", "one\nFORK\nthree\n")
+        dc = self.w.drawboard_commit("a.txt", "one\nDRAWBOARD\nthree\n", "dc")
+        self.assertEqual(self.ok(self.w.bring_in()).outputs["outcome"], "conflict-pr")
+        branch = f"{PERSON_PFX}{dc[:12]}"
+        person = self.w.clone(self.w.fork, "person", branch=T)
+        git(person, "fetch", "--quiet", "origin", branch)
+        git(person, "checkout", "--quiet", "-b", "pr", "FETCH_HEAD")
+        git(person, "merge", "--quiet", "-X", "ours", "--no-edit", f"origin/{T}")        # "resolve conflicts": T merged into the PR branch
+        git(person, "push", "--quiet", "origin", f"HEAD:refs/heads/{branch}")
+        git(person, "checkout", "--quiet", T)
+        git(person, "merge", "--quiet", "--no-ff", "-m", f"Merge pull request #1 from authagonal/{branch}", "pr")
+        git(person, "push", "--quiet", "origin", f"HEAD:refs/heads/{T}")
+        self.assertEqual(self.ok(self.w.bring_in()).outputs["outcome"], "contained")
+        d2 = self.w.drawboard_commit("next.txt", "on top of dc\n")
+        r = self.ok(self.w.bring_in())
+        self.assertEqual((r.outputs["outcome"], r.outputs["drawboard"]), ("merged", d2), r.stdout)
+
+    def test_a_person_merge_of_something_else_is_not_a_drawboard_head(self):
+        d = self.w.drawboard_commit("new.txt", "from drawboard\n")
+        feature = self.w.clone(self.w.fork, "feature", branch=T)
+        git(feature, "checkout", "--quiet", "-b", "feature")
+        self.w.write(feature, "feature.txt", "f\n")
+        self.w.commit(feature, "feature work")
+        git(feature, "checkout", "--quiet", T)
+        git(feature, "merge", "--quiet", "--no-ff", "-m", "Merge pull request #7 from authagonal/feature", "feature")
+        git(feature, "push", "--quiet", "origin", f"HEAD:refs/heads/{T}")
+        r = self.ok(self.w.bring_in())
+        self.assertEqual((r.outputs["outcome"], r.outputs["drawboard"]), ("merged", d), r.stdout)
+
     def test_trailer_constant_is_the_head_the_fork_was_built_from(self):
         spec = importlib.util.spec_from_file_location("sync_under_test", SYNC)
         mod = importlib.util.module_from_spec(spec)
