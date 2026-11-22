@@ -43,7 +43,9 @@ DRAWBOARD_WEB = "https://github.com/DrawboardLtd/ingress-nginx"
 CERT_ISSUER = "https://token.actions.githubusercontent.com"
 CERT_IDENTITY_REGEXP = r"^https://github\.com/authagonal/ingress-nginx/\.github/workflows/authagonal-images\.yml@refs/"
 REF_RE = re.compile(r"^([^/]+)/([^:]+):([^@]+)@(sha256:[0-9a-f]{64})$")  # the form main.tf's regex() takes apart
-MAX_COMMIT_LINKS = 600  # a PR body holds 65536 characters; a link line is about 100
+PR_BODY_LIMIT = 65536  # GitHub refuses a PR body longer than this
+COMMITS_BUDGET = 50000  # what the commit list may take of it: the rest holds the refs, the cosign commands and the run, about 3000 for three refs
+MAX_SUBJECT = 200
 
 
 class SyncError(Exception):
@@ -396,10 +398,18 @@ def commits_section(cfg, pinned_controller, D):
     if not revs:
         return (f"None: develop's pinned controller was built from `{info[:12]}`, which already has every commit in Drawboard's `{D[:12]}`. "
                 f"This is an image rebuild only.")
-    lines = [f"- {DRAWBOARD_WEB}/commit/{r.split(' ', 1)[0]} {r.split(' ', 1)[1] if ' ' in r else ''}".rstrip() for r in revs[:MAX_COMMIT_LINKS]]
-    more = len(revs) - MAX_COMMIT_LINKS
+    compare = f"- and {{}} older ones: {DRAWBOARD_WEB}/compare/{info}...{D}"
+    lines, used = [], len(compare.format(len(revs)))  # the last line's room is kept from the start
+    for r in revs:
+        sha, _, subject = r.partition(" ")
+        line = f"- {DRAWBOARD_WEB}/commit/{sha} {subject[:MAX_SUBJECT]}".rstrip()
+        if used + len(line) + 1 > COMMITS_BUDGET:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    more = len(revs) - len(lines)
     if more > 0:
-        lines.append(f"- and {more} older ones: {DRAWBOARD_WEB}/compare/{info}...{D}")
+        lines.append(compare.format(more))
     return (f"{len(revs)} commits in Drawboard's `{D[:12]}` that the commit develop's pinned controller was built from (`{info[:12]}`) lacks:\n\n"
             + "\n".join(lines))
 

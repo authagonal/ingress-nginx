@@ -1,8 +1,9 @@
 """bump: D-5. One commit as the App on the bump branch from develop's head, the PR into develop with its refs, cosign commands, run URL and
 Drawboard commit links, and the wait for a terraform.yml run in progress."""
 import re
+import subprocess
 
-from .support import CLOUD_REPO, MAIN_TF, SHA_A, SHA_B, SHA_C, WorldCase, git
+from .support import CLOUD_REPO, MAIN_TF, SHA_A, SHA_B, SHA_C, T, WorldCase, git
 
 CTL = "ghcr.io/authagonal/ingress-nginx/controller:v1.0.1-%s@" + SHA_C
 CERTGEN_PINNED = "ghcr.io/authagonal/ingress-nginx/kube-webhook-certgen:v1.6.9-4b54b827e2fa-go1.26.2@" + SHA_B
@@ -99,6 +100,22 @@ class BumpTest(WorldCase):
         self.assertEqual(sorted(want), sorted([self.d1, self.d2]))
         self.assertIn(f"https://github.com/DrawboardLtd/ingress-nginx/commit/{self.d1} first drawboard fix", body)
         self.assertNotIn("None:", body)
+
+    def test_a_long_range_keeps_the_pr_body_under_githubs_limit_and_links_the_whole_range(self):
+        self.prepare()
+        n = 800  # about 96 characters of link plus a 60-character subject each: far past 65536 together
+        stream = "".join(f"commit refs/heads/{T}\ncommitter T <t@example.com> {1700000000 + i} +0000\ndata {len(m := f'drawboard change {i:04d} ' + 'x' * 40)}\n{m}\n"
+                         f"{'from ' + self.d2 + chr(10) if i == 0 else ''}\n" for i in range(n))
+        subprocess.run(["git", "fast-import", "--quiet", "--force"], cwd=self.w.drawboard, input=stream, text=True, check=True)
+        d = git(self.w.drawboard, "rev-parse", T)
+        self.merge = d
+        self.ok(self.w.sync("bump", "--controller", CTL % d[:12], "--commit", d, "--drawboard", d, "--branch", BRANCH % d[:12], "--run-url", RUN_URL))
+        (pr,) = self.w.pulls(CLOUD_REPO)
+        self.assertLess(len(pr["body"]), 65536)
+        links = LINK.findall(pr["body"])
+        self.assertGreater(len(links), 300, "a long range still lists the newest commits")
+        self.assertEqual(links[0], d)
+        self.assertRegex(pr["body"], rf"and {n + 2 - len(links)} older ones: https://github\.com/DrawboardLtd/ingress-nginx/compare/")
 
     def test_commits_none_when_the_pinned_build_has_every_drawboard_commit(self):
         self.prepare()

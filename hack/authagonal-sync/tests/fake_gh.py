@@ -50,6 +50,8 @@ if parts[0] == "repos" and len(parts) >= 4 and parts[3] == "pulls":
         want = query.get("head", "").split(":", 1)[-1]
         finish(0, [p for p in pulls if p["head"]["ref"] == want])
     if method == "POST":
+        if len(payload.get("body") or "") > 65536:  # GitHub's limit on a PR body: a 422
+            finish(1, err="HTTP 422: Validation Failed: body is too long (maximum is 65536 characters)")
         n = 100 + sum(len(v) for v in st["pulls"].values())
         pr = {"number": n, "state": "open", "title": payload["title"], "body": payload["body"], "head": {"ref": payload["head"]},
               "base": {"ref": payload["base"]}, "html_url": f"https://github.com/{repo}/pull/{n}"}
