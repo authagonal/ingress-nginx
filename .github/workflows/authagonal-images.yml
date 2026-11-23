@@ -1,0 +1,303 @@
+# Authagonal's build of the ingress-nginx controller.
+#
+# This fork tracks drawboard/main (a Chainguard controller-v* release plus our own commits). Chainguard backports nginx
+# security fixes as patches under images/nginx/rootfs/patches, but NGINX_BASE still names upstream's unpatched base image
+# (registry.k8s.io/ingress-nginx/nginx:v2.2.8). So the patches only reach a running controller if the nginx base image
+# is built from images/nginx here, and the controller is built on top of that base. The chart's admission webhook runs
+# kube-webhook-certgen, which upstream no longer rebuilds, so that image is built from this tree too. That is what this
+# workflow does:
+#
+#   nginx-tests  nginx's own test suite against the patched nginx (images/nginx/tests).
+#   images       base image  ghcr.io/authagonal/ingress-nginx/nginx:<images/nginx/TAG>-<tree hash of images/nginx>
+#                controller  ghcr.io/authagonal/ingress-nginx/controller:<controller-v* tag>-<commit>
+#                certgen     ghcr.io/authagonal/ingress-nginx/kube-webhook-certgen:<images/kube-webhook-certgen/TAG>-<tree hash of that directory>-go<GOLANG_VERSION>
+#                The base and certgen tags carry the tree hash of their directory, and certgen's also the root
+#                GOLANG_VERSION its Dockerfile builds with, so each is only pushed when one of its inputs changes; a tag already in the registry is never rebuilt or overwritten. linux/amd64 only:
+#                every node is amd64. Each image carries org.opencontainers.image.source, which links its GHCR package
+#                to this repository.
+#
+# Pull requests build and smoke-test all three images without signing in, pushing or signing. A push to drawboard/main,
+# or a manual run on any ref, publishes them: it signs in to GHCR with the run's GITHUB_TOKEN, pushes what is new, and
+# signs all three digests with cosign keyless (the run's OIDC token; no key to keep). Every step that touches the
+# registry or signs is named "Publish:", so a run's step list shows whether it published. The last step prints, and
+# adds to the job summary, one line per image: "authagonal-image <name> <repository>:<tag>@sha256:<digest>".
+#
+# Setup (one-off): none beyond the repository itself. GHCR makes a package private when the first publish creates it;
+# make each of the three packages public (package settings) before a cluster pulls it anonymously.
+#
+# Verifying an image (needs only cosign):
+#   cosign verify ghcr.io/authagonal/ingress-nginx/<name>@<digest> \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#     --certificate-identity-regexp '^https://github\.com/authagonal/ingress-nginx/\.github/workflows/authagonal-images\.yml@refs/'
+#
+# Taking a new release (e.g. controller-v1.15.17): merge it into drawboard/main and push the tag too; the controller
+# image is named after the newest controller-v* tag git describe finds.
+
+name: Authagonal images
+
+on:
+  push:
+    branches: [drawboard/main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: The commit to build
+        type: string
+        required: true
+    outputs:
+      controller:
+        description: The controller image, <repository>:<tag>@sha256:<digest>
+        value: ${{ jobs.images.outputs.controller }}
+      certgen:
+        description: The kube-webhook-certgen image, <repository>:<tag>@sha256:<digest>
+        value: ${{ jobs.images.outputs.certgen }}
+      base:
+        description: The patched nginx base image, <repository>:<tag>@sha256:<digest>
+        value: ${{ jobs.images.outputs.base }}
+
+permissions: {}
+
+concurrency:
+  group: authagonal-images-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ghcr.io/authagonal/ingress-nginx
+  PLATFORM: linux/amd64
+  SOURCE: https://github.com/authagonal/ingress-nginx
+
+jobs:
+  nginx-tests:
+    name: NGINX / Tests (patched)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref }} # empty unless called, which is the event's own commit
+          persist-credentials: false
+
+      - name: Run nginx-tests against the patched nginx
+        run: make -C images/nginx test
+
+  images:
+    name: Images (build, smoke test, publish)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    needs: nginx-tests
+    permissions:
+      contents: read
+      packages: write # push to GHCR with the GITHUB_TOKEN; only used when publishing
+      id-token: write # cosign keyless signing; only used when publishing
+    outputs:
+      # <repository>:<tag>@sha256:<digest>; empty unless the run published (the Publish: push step sets the digests)
+      controller: ${{ steps.push.outputs.controller_digest && format('{0}@{1}', steps.tags.outputs.controller, steps.push.outputs.controller_digest) || '' }}
+      certgen: ${{ steps.push.outputs.certgen_digest && format('{0}@{1}', steps.tags.outputs.certgen, steps.push.outputs.certgen_digest) || '' }}
+      base: ${{ steps.push.outputs.base_digest && format('{0}@{1}', steps.tags.outputs.base, steps.push.outputs.base_digest) || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0 # git describe needs the controller-v* tags
+          ref: ${{ inputs.ref }} # empty unless called, which is the event's own commit
+          persist-credentials: false
+
+      - name: Check that the certgen tag follows GOLANG_VERSION
+        run: hack/test-authagonal-certgen-tag.sh
+
+      - name: Image tags
+        id: tags
+        env:
+          PUBLISH: ${{ github.event_name != 'pull_request' }}
+        run: |
+          base_tag="$(cat images/nginx/TAG)-$(git rev-parse --short=12 HEAD:images/nginx)"
+          release=$(git describe --tags --match 'controller-v*' --abbrev=0 | sed 's/^controller-//')
+          ctrl_tag="${release}-$(git rev-parse --short=12 HEAD)"
+          certgen_tag="$(hack/authagonal-certgen-tag.sh)"
+          {
+            echo "base=${REGISTRY}/nginx:${base_tag}"
+            echo "controller=${REGISTRY}/controller:${ctrl_tag}"
+            echo "certgen=${REGISTRY}/kube-webhook-certgen:${certgen_tag}"
+            echo "ctrl_tag=${ctrl_tag}"
+            echo "publish=${PUBLISH}"
+          } >> "$GITHUB_OUTPUT"
+          echo "base image:       ${REGISTRY}/nginx:${base_tag}"
+          echo "controller image: ${REGISTRY}/controller:${ctrl_tag}"
+          echo "certgen image:    ${REGISTRY}/kube-webhook-certgen:${certgen_tag}"
+          echo "publish:          ${PUBLISH}"
+
+      - name: "Publish: sign in to GHCR"
+        if: steps.tags.outputs.publish == 'true'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          # The docker driver builds into the local daemon: the controller build (make image, plain docker build) must
+          # see the base image built in the step before, which a docker-container builder would try to pull instead.
+          driver: docker
+
+      - name: Base image already in the registry?
+        id: base
+        env:
+          BASE: ${{ steps.tags.outputs.base }}
+        run: |
+          if [ "${{ steps.tags.outputs.publish }}" = "true" ] && docker manifest inspect "$BASE" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"; echo "$BASE is in the registry; not rebuilding it."
+            docker pull --platform "$PLATFORM" "$BASE"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the nginx base image (with the patches)
+        if: steps.base.outputs.exists != 'true'
+        env:
+          BASE: ${{ steps.tags.outputs.base }}
+        run: |
+          cd images/nginx/rootfs
+          docker buildx build --platform "$PLATFORM" --load --progress plain \
+            --label "org.opencontainers.image.source=${SOURCE}" -t "$BASE" .
+
+      - name: kube-webhook-certgen image already in the registry?
+        id: certgen
+        env:
+          CERTGEN: ${{ steps.tags.outputs.certgen }}
+        run: |
+          if [ "${{ steps.tags.outputs.publish }}" = "true" ] && docker manifest inspect "$CERTGEN" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"; echo "$CERTGEN is in the registry; not rebuilding it."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the kube-webhook-certgen image
+        if: steps.certgen.outputs.exists != 'true'
+        env:
+          CERTGEN: ${{ steps.tags.outputs.certgen }}
+        run: |
+          docker buildx build --platform "$PLATFORM" --load --progress plain \
+            --build-arg GOLANG_VERSION="$(cat GOLANG_VERSION)" \
+            --label "org.opencontainers.image.source=${SOURCE}" \
+            -t "$CERTGEN" images/kube-webhook-certgen/rootfs
+
+      - name: Build the controller image on that base
+        env:
+          BASE: ${{ steps.tags.outputs.base }}
+          CTRL_TAG: ${{ steps.tags.outputs.ctrl_tag }}
+        run: make ARCH=amd64 TAG="$CTRL_TAG" REGISTRY="$REGISTRY" BASE_IMAGE="$BASE" build image
+
+      - name: Point the controller image's source label at this repository
+        env:
+          CONTROLLER: ${{ steps.tags.outputs.controller }}
+        run: |
+          # rootfs/Dockerfile hard-codes upstream's source label and the Makefile passes no extra build args, so the
+          # label is replaced on the built image. A FROM-only build changes the image's config and adds no layer.
+          printf 'FROM %s\n' "$CONTROLLER" | docker build --label "org.opencontainers.image.source=${SOURCE}" -t "$CONTROLLER" -
+          docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.source"}}' "$CONTROLLER"
+
+      - name: Smoke test the controller image
+        env:
+          BASE: ${{ steps.tags.outputs.base }}
+          CONTROLLER: ${{ steps.tags.outputs.controller }}
+        run: |
+          docker run --rm --entrypoint /nginx-ingress-controller "$CONTROLLER" --version
+          nginx_v=$(docker run --rm --entrypoint nginx "$CONTROLLER" -V 2>&1)
+          echo "$nginx_v"
+          want=$(sed -n 's/^export NGINX_VERSION=//p' images/nginx/rootfs/build.sh)
+          echo "$nginx_v" | grep -q "nginx version: nginx/${want}" || { echo "::error::expected nginx/${want}"; exit 1; }
+          # The version alone cannot tell the patched build from upstream's unpatched base (both are 1.27.1), so the
+          # controller's nginx binary must be byte-identical to the one in the base image built from images/nginx.
+          nginx_sum() { docker run --rm --entrypoint sh "$1" -c 'sha256sum "$(readlink -f "$(command -v nginx)")"' | cut -d' ' -f1; }
+          base_sum=$(nginx_sum "$BASE"); ctrl_sum=$(nginx_sum "$CONTROLLER")
+          echo "nginx sha256: base ${base_sum}, controller ${ctrl_sum}"
+          [ -n "$base_sum" ] && [ "$base_sum" = "$ctrl_sum" ] || { echo "::error::the controller's nginx is not the patched base's nginx"; exit 1; }
+          # And the check can tell the two apart: upstream's unpatched base (NGINX_BASE) must carry a different nginx.
+          upstream_sum=$(nginx_sum "$(cat NGINX_BASE)")
+          echo "nginx sha256: upstream unpatched base (NGINX_BASE) ${upstream_sum}"
+          [ -n "$upstream_sum" ] && [ "$upstream_sum" != "$base_sum" ] || { echo "::error::the patched nginx is identical to upstream's unpatched one"; exit 1; }
+
+      - name: "Publish: push the images"
+        id: push
+        if: steps.tags.outputs.publish == 'true'
+        env:
+          BASE: ${{ steps.tags.outputs.base }}
+          CONTROLLER: ${{ steps.tags.outputs.controller }}
+          CERTGEN: ${{ steps.tags.outputs.certgen }}
+        run: |
+          # Only an image built in this run is pushed; the controller is built on every run.
+          if [ "${{ steps.base.outputs.exists }}" != "true" ]; then docker push "$BASE"; fi
+          if [ "${{ steps.certgen.outputs.exists }}" != "true" ]; then docker push "$CERTGEN"; fi
+          docker push "$CONTROLLER"
+
+          # digest_of REF LOCAL: the sha256 digest REF has in GHCR. LOCAL=true: the image was pushed or pulled by this
+          # run, so the local daemon knows it. LOCAL=false: it was skipped and not pulled, so ask the registry.
+          digest_of() {
+            if [ "$2" = "true" ]; then
+              docker inspect --format '{{join .RepoDigests "\n"}}' "$1" | grep -F "${1%:*}@" | head -n 1 | cut -d@ -f2
+            else
+              docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' | jq -r .digest
+            fi
+          }
+          check_digest() {
+            printf '%s' "$2" | grep -Eq '^sha256:[0-9a-f]{64}$' || { echo "::error::no sha256 digest for $1 (got '$2')"; exit 1; }
+          }
+          base_digest=$(digest_of "$BASE" true); check_digest "$BASE" "$base_digest"
+          ctrl_digest=$(digest_of "$CONTROLLER" true); check_digest "$CONTROLLER" "$ctrl_digest"
+          if [ "${{ steps.certgen.outputs.exists }}" != "true" ]; then local_certgen=true; else local_certgen=false; fi
+          certgen_digest=$(digest_of "$CERTGEN" "$local_certgen"); check_digest "$CERTGEN" "$certgen_digest"
+          {
+            echo "base_digest=${base_digest}"
+            echo "controller_digest=${ctrl_digest}"
+            echo "certgen_digest=${certgen_digest}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: "Publish: install cosign"
+        if: steps.tags.outputs.publish == 'true'
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      - name: "Publish: sign the images (cosign keyless)"
+        if: steps.tags.outputs.publish == 'true'
+        env:
+          BASE_DIGEST: ${{ steps.push.outputs.base_digest }}
+          CONTROLLER_DIGEST: ${{ steps.push.outputs.controller_digest }}
+          CERTGEN_DIGEST: ${{ steps.push.outputs.certgen_digest }}
+        run: |
+          # All three, on every publishing run: an image pushed by an earlier run whose signing failed is signed now.
+          cosign sign --yes "${REGISTRY}/nginx@${BASE_DIGEST}"
+          cosign sign --yes "${REGISTRY}/controller@${CONTROLLER_DIGEST}"
+          cosign sign --yes "${REGISTRY}/kube-webhook-certgen@${CERTGEN_DIGEST}"
+
+      - name: "Publish: record the digests"
+        if: steps.tags.outputs.publish == 'true'
+        env:
+          BASE: ${{ steps.tags.outputs.base }}
+          CONTROLLER: ${{ steps.tags.outputs.controller }}
+          CERTGEN: ${{ steps.tags.outputs.certgen }}
+          BASE_DIGEST: ${{ steps.push.outputs.base_digest }}
+          CONTROLLER_DIGEST: ${{ steps.push.outputs.controller_digest }}
+          CERTGEN_DIGEST: ${{ steps.push.outputs.certgen_digest }}
+        run: |
+          {
+            echo "### Images published"
+            echo ""
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          record() {
+            line=$(printf 'authagonal-image %s %s@%s' "$1" "$2" "$3")
+            echo "$line"
+            echo "$line" >> "$GITHUB_STEP_SUMMARY"
+          }
+          record nginx "$BASE" "$BASE_DIGEST"
+          record controller "$CONTROLLER" "$CONTROLLER_DIGEST"
+          record kube-webhook-certgen "$CERTGEN" "$CERTGEN_DIGEST"
+          {
+            echo '```'
+            echo ""
+            echo "Signed with cosign keyless; verify with the command in this workflow's header."
+          } >> "$GITHUB_STEP_SUMMARY"
